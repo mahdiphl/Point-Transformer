@@ -1,4 +1,6 @@
 
+
+
 """A hookable copy of the Point Transformer V3 forward pass, for adding your own features.
 
 ``PointTransformerV3Custom`` subclasses the package's ``PointTransformerV3`` and re-implements
@@ -50,15 +52,15 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from model import (
+from point_transformer_v3.model import (
     PointTransformerV3,
     _LevelOrders,
     _release,
     _to_point,
 )
-from modules import check_input
-from structure import Level, Point, PointGrid
-from structure import auto_depth
+from point_transformer_v3.modules import check_input
+from point_transformer_v3.structure import Level, Point, PointGrid
+from point_transformer_v3.structure import auto_depth
 
 __all__ = ["PointTransformerV3Custom", "pool_to_level"]
 

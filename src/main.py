@@ -1,4 +1,5 @@
 
+
 """Train Point Transformer V3 (random init) on the datasets of ``data_pyg.py``.
 
 Tasks (picked from ``--dataset``):
@@ -32,8 +33,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch_geometric.nn import global_max_pool, global_mean_pool
+from tqdm.auto import tqdm
 
-#import point_transformer_v3 as ptv3
+import point_transformer_v3 as ptv3
 from data_pyg import NUM_CLASSES, get_dataset  # rename "data_pyg (6).py" -> data_pyg.py
 from ptv3_custom import PointTransformerV3Custom  # hookable copy of the model (subclass it)
 
@@ -97,6 +99,16 @@ class Segmenter(nn.Module):
         return self.head(out["feat"].float())  # (sum kept points, num_classes)
 
 
+def resolve_precision(requested: str, device: torch.device) -> str:
+    """``auto`` -> bf16 on Ampere+ GPUs, fp32 otherwise (a T4 / V100 / P100 has no bf16 gemm that
+    the sparse-conv backward needs; fp16 works there but needs loss scaling: ask for it)."""
+    if requested != "auto":
+        return requested
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8:
+        return "bf16"
+    return "fp32"
+
+
 # --------------------------------------------------------------------------- data
 def unpack(batch, task: str):
     """Dataset item -> (clouds (B,N,3), labels). The ECT features (2nd element) are dropped."""
@@ -134,13 +146,15 @@ def seg_logits_per_point(logits, point, inverses):
 
 
 # --------------------------------------------------------------------------- train / eval
-def run_epoch(model, loader, task, args, device, num_classes, optimizer=None, scheduler=None):
+def run_epoch(model, loader, task, args, device, num_classes, optimizer=None, scheduler=None,
+              scaler=None):
     train = optimizer is not None
     model.train(train)
     loss_sum, n_seen, n_correct = 0.0, 0, 0
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long) if task == "seg" else None
 
-    for batch in loader:
+    bar = tqdm(loader, desc="train" if train else "test ", leave=False, dynamic_ncols=True)
+    for batch in bar:
         clouds, labels = unpack(batch, task)
         labels = labels.to(device, non_blocking=True)
         point, inverses = make_point(clouds, device, args.grid_size)
@@ -154,15 +168,18 @@ def run_epoch(model, loader, task, args, device, num_classes, optimizer=None, sc
 
         if train:
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()  # a disabled scaler (fp32 / bf16) is a pass-through
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
         pred = out.argmax(1)
         loss_sum += loss.item() * labels.numel()
         n_seen += labels.numel()
         n_correct += (pred == labels).sum().item()
+        bar.set_postfix(loss=f"{loss_sum / n_seen:.4f}", acc=f"{n_correct / n_seen:.4f}")
         if confusion is not None:
             idx = labels * num_classes + pred
             confusion += torch.bincount(idx, minlength=num_classes**2).view(num_classes, -1).cpu()
@@ -199,6 +216,8 @@ def parse_args():
                    help="grid cell (clouds are unit-normalised, so ~[-1, 1]); smaller = more points kept")
     p.add_argument("--patch-size", type=int, default=1024)
     p.add_argument("--drop-path", type=float, default=0.1)
+    p.add_argument("--precision", default="auto", choices=["auto", "fp32", "fp16", "bf16"],
+                   help="auto: bf16 on Ampere+ GPUs, fp32 otherwise (e.g. Kaggle T4)")
     # optimisation
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=32)
@@ -246,6 +265,9 @@ def main():
     # ---- model (input features = the grid-sampled xyz -> 3 channels)
     backbone = build_backbone(task, in_channels=3, patch_size=args.patch_size,
                               drop_path=args.drop_path)
+    backbone.precision = resolve_precision(args.precision, device)  # read by the model's autocast
+    print(f"precision: {backbone.precision}")
+    scaler = torch.amp.GradScaler("cuda", enabled=backbone.precision == "fp16")
     model = (Classifier if task == "cls" else Segmenter)(backbone, num_classes).to(device)
     print(f"parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
 
@@ -275,7 +297,8 @@ def main():
     key = "miou" if task == "seg" else "acc"  # metric that decides the best checkpoint
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
-        tr = run_epoch(model, train_loader, task, args, device, num_classes, optimizer, scheduler)
+        tr = run_epoch(model, train_loader, task, args, device, num_classes, optimizer, scheduler,
+                       scaler)
         te = run_epoch(model, test_loader, task, args, device, num_classes)
         msg = (f"epoch {epoch + 1:3d}/{args.epochs}  lr {scheduler.get_last_lr()[0]:.2e}  "
                f"train loss {tr['loss']:.4f} acc {tr['acc']:.4f}  |  "
